@@ -90,7 +90,7 @@ async def _gemini(system: str, user: str, timeout: float) -> str | None:
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1200,
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1800,
                              "responseMimeType": "application/json",
                              "thinkingConfig": {"thinkingBudget": 0}},
     }
