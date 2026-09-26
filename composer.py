@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 import llm
@@ -261,6 +262,41 @@ def validate_body(body: Any, facts: dict, prior_bodies: list[str], mode: str = "
 
 
 # --------------------------------------------------------------------------------------
+# Deterministic draft scorer (mirrors the 5 judging dimensions, no extra LLM call)
+# --------------------------------------------------------------------------------------
+
+def score_draft(body: str, facts: dict, send_as: str, hinglish: bool) -> int:
+    b = body.strip()
+    low = b.lower()
+    score = 0
+    allowed = allowed_numbers(facts)
+    used = {m.group().replace(",", "") for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", b)}
+    score += min(3, len([u for u in used if u in allowed and u not in SAFE_SMALL]))          # specificity
+    item = _g(facts, "trigger", "resolved_digest_item") or {}
+    if item.get("source") and str(item["source"]).split(",")[0].lower() in low:
+        score += 1                                                                          # source cited
+    sal = (_g(facts, "customer", "name") if send_as == "merchant_on_behalf" else _g(facts, "merchant", "salutation")) or ""
+    if sal and sal.lower() in low[:60]:
+        score += 1                                                                          # merchant fit
+    offers = (_g(facts, "merchant", "active_offers", default=[]) or []) + (facts.get("category_catalog_offers") or [])
+    if any(o and o.split("@")[0].strip().lower() in low for o in offers):
+        score += 1                                                                          # service+price
+    vocab = _g(facts, "category_voice", "vocab_allowed", default=[]) or []
+    if any(v.lower() in low for v in vocab):
+        score += 1                                                                          # category fit
+    last = re.split(r"(?<=[.!?])\s+", b)[-1].lower()
+    if "?" in last or "reply" in last or "confirm" in last:
+        score += 2                                                                          # single CTA at the end
+    if b.count("?") > 2:
+        score -= 1                                                                          # too many asks
+    if 220 <= len(b) <= 560:
+        score += 1                                                                          # WhatsApp-length
+    if hinglish == bool(re.search(r"\b(aap|aapke|hai|hain|kar|karein|doon|abhi|ji)\b", low)):
+        score += 1                                                                          # language match
+    return score
+
+
+# --------------------------------------------------------------------------------------
 # LLM prompts
 # --------------------------------------------------------------------------------------
 SYSTEM_COMPOSE = """You are Vera, magicpin's merchant-growth assistant on WhatsApp. You write ONE outbound WhatsApp message.
@@ -278,7 +314,8 @@ Hard rules:
 - Never mention internal terms like "trigger", "signal", "payload", "context", "suppression".
 - If sending on behalf of the merchant to a customer: speak as the merchant's business ("<business> here"), warm, no medical claims, honour the customer's preferences and language.
 
-Return STRICT JSON: {"body": "...", "cta": "open_ended|binary_yes_no|binary_confirm_cancel|multi_choice_slot|none", "rationale": "1-2 sentences: which facts you anchored on and why this lever", "key_fact": "the single most important fact used"}"""
+Write TWO different drafts that use different compulsion levers (e.g. draft 1 = loss aversion/specific numbers, draft 2 = curiosity/effort externalization). Both must follow every rule.
+Return STRICT JSON: {"drafts": [{"body": "...", "cta": "open_ended|binary_yes_no|binary_confirm_cancel|multi_choice_slot|none", "rationale": "1-2 sentences: which facts you anchored on and why this lever"}, {"body": "...", "cta": "...", "rationale": "..."}]}"""
 
 SYSTEM_REPLY = """You are Vera, magicpin's merchant-growth assistant, continuing a WhatsApp conversation.
 
@@ -491,18 +528,33 @@ async def compose(category: dict | None, merchant: dict, trigger: dict, customer
     source = "fallback"
     body, cta, rationale = None, strategy[2], None
     if llm.enabled():
+        t0 = time.monotonic()
         for attempt in range(2):
-            out = await llm.complete_json(SYSTEM_COMPOSE, _compose_user_prompt(facts, strategy, send_as, hinglish, errors), timeout=8.5 if attempt == 0 else 6.0)
+            if attempt == 1 and time.monotonic() - t0 > 4.5:
+                break  # no time budget left for a retry -> template fallback
+            out = await llm.complete_json(SYSTEM_COMPOSE, _compose_user_prompt(facts, strategy, send_as, hinglish, errors), timeout=10.0 if attempt == 0 else 6.0)
             if not out:
                 break
-            errs = validate_body(out.get("body"), facts, prior_bodies)
-            if not errs:
-                body = out["body"].strip()
-                cta = out.get("cta") if out.get("cta") in CTA_VALUES else strategy[2]
-                rationale = str(out.get("rationale") or "").strip()[:400]
+            drafts = out.get("drafts") if isinstance(out.get("drafts"), list) else [out]
+            valid, all_errs = [], []
+            for d in drafts[:3]:
+                if not isinstance(d, dict):
+                    continue
+                errs = validate_body(d.get("body"), facts, prior_bodies)
+                if errs:
+                    all_errs += errs
+                else:
+                    valid.append((score_draft(d["body"], facts, send_as, hinglish), d))
+            if valid:
+                valid.sort(key=lambda x: -x[0])
+                best_score, best = valid[0]
+                body = best["body"].strip()
+                cta = best.get("cta") if best.get("cta") in CTA_VALUES else strategy[2]
+                rationale = str(best.get("rationale") or "").strip()[:400]
+                rationale += f" (best of {len(valid)} valid drafts, self-score {best_score})"
                 source = "llm"
                 break
-            errors = errs
+            errors = sorted(set(all_errs))
     if body is None:
         body, cta = fallback_compose(facts, send_as, hinglish)
         if validate_body(body, facts, prior_bodies):
