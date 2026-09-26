@@ -58,7 +58,10 @@ async def complete_json(system: str, user: str, timeout: float = 9.0) -> dict | 
         return None
     try:
         if PROVIDER == "gemini":
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+            if API_KEY.startswith("AQ."):  # Vertex AI express-mode key
+                url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{MODEL}:generateContent"
+            else:  # Google AI Studio key (AIza...)
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
             body = {
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -70,6 +73,8 @@ async def complete_json(system: str, user: str, timeout: float = 9.0) -> dict | 
                 },
             }
             r = await _http().post(url, json=body, headers={"x-goog-api-key": API_KEY}, timeout=timeout)
+            if r.status_code >= 400:
+                print(f"[llm] gemini HTTP {r.status_code}: {r.text[:300]}")
             if r.status_code == 400 and "thinking" in r.text.lower():
                 body["generationConfig"].pop("thinkingConfig", None)
                 r = await _http().post(url, json=body, headers={"x-goog-api-key": API_KEY}, timeout=timeout)

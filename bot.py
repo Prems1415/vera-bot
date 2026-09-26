@@ -383,3 +383,13 @@ async def _keepalive():
                     pass
 
     asyncio.create_task(loop())
+
+
+@app.get("/v1/llmcheck")
+async def llmcheck():
+    """Diagnostic: confirms the LLM key works (never returns the key)."""
+    if not llm.enabled():
+        return {"llm_enabled": False, "provider": llm.PROVIDER}
+    t = time.time()
+    out = await llm.complete_json('Return JSON {"ok": true, "word": "<one word>"}', "Say hello in one word.", timeout=10)
+    return {"llm_enabled": True, "provider": llm.PROVIDER, "model": llm.MODEL, "ok": bool(out), "latency_s": round(time.time() - t, 2)}
